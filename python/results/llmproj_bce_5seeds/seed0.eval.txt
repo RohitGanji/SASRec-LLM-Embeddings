@@ -1,0 +1,11 @@
+average sequence length: 141.12
+load_state_dict strict=False
+  missing keys: ['llm_item_emb', 'cold_item_mask']
+  unexpected keys: []
+............................................................test (NDCG@10: 0.4631, HR@10: 0.6957)
+[cold dbg] user=5, gt_item=1570, rank=7
+[cold dbg] user=17, gt_item=490, rank=23
+[cold dbg] user=22, gt_item=732, rank=48
+[cold dbg] user=23, gt_item=3242, rank=2
+[cold dbg] user=26, gt_item=2843, rank=7
+cold_test k=0 (NDCG@10: 0.1747, HR@10: 0.3783, users: 1705)

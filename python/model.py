@@ -62,8 +62,59 @@ class SASRec(torch.nn.Module):
             # self.pos_sigmoid = torch.nn.Sigmoid()
             # self.neg_sigmoid = torch.nn.Sigmoid()
 
+            # LLM cold-start (optional)
+        self.use_llm = args.use_llm
+        self.llm_dim = args.llm_dim
+
+        # buffers will be attached from main.py (so baseline unaffected)
+        self.register_buffer("llm_item_emb", torch.empty(0))      # [itemnum+1, llm_dim]
+        self.register_buffer("cold_item_mask", torch.empty(0, dtype=torch.bool))  # [itemnum+1]
+
+        self.llm_proj = torch.nn.Linear(self.llm_dim, args.hidden_units, bias=False)
+
+    def set_llm_buffers(self, llm_item_emb: torch.Tensor, cold_item_mask: torch.Tensor):
+        """
+        llm_item_emb: FloatTensor [itemnum+1, llm_dim]
+        cold_item_mask: BoolTensor [itemnum+1]
+        """
+        self.llm_item_emb = llm_item_emb
+        self.cold_item_mask = cold_item_mask
+
+
+    # def get_item_embedding(self, item_ids):
+    #     emb = self.item_emb(item_ids)
+
+    #     if not self.use_llm:
+    #         return emb
+
+    #     cold_mask = self.cold_item_mask[item_ids]
+    #     if cold_mask.any():
+    #         emb[cold_mask] = self.llm_proj(
+    #             self.llm_item_emb[item_ids[cold_mask]]
+    #         )
+
+    #     return emb
+
+    def get_item_embedding(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """
+        item_ids: LongTensor of any shape
+        returns: [*shape, hidden_units]
+        """
+        emb = self.item_emb(item_ids)
+
+        if (not self.use_llm) or self.llm_item_emb.numel() == 0 or self.cold_item_mask.numel() == 0:
+            return emb
+
+        cold_mask = self.cold_item_mask[item_ids]  # same shape as item_ids
+        if cold_mask.any():
+            emb = emb.clone()
+            emb[cold_mask] = self.llm_proj(self.llm_item_emb[item_ids[cold_mask]])
+        return emb
+
+
+
     def log2feats(self, log_seqs): # TODO: fp64 and int64 as default in python, trim?
-        seqs = self.item_emb(torch.LongTensor(log_seqs).to(self.dev))
+        seqs = self.get_item_embedding(torch.LongTensor(log_seqs).to(self.dev))
         seqs *= self.item_emb.embedding_dim ** 0.5
         poss = np.tile(np.arange(1, log_seqs.shape[1] + 1), [log_seqs.shape[0], 1])
         # TODO: directly do tensor = torch.arange(1, xxx, device='cuda') to save extra overheads
@@ -97,8 +148,8 @@ class SASRec(torch.nn.Module):
     def forward(self, user_ids, log_seqs, pos_seqs, neg_seqs): # for training        
         log_feats = self.log2feats(log_seqs) # user_ids hasn't been used yet
 
-        pos_embs = self.item_emb(torch.LongTensor(pos_seqs).to(self.dev))
-        neg_embs = self.item_emb(torch.LongTensor(neg_seqs).to(self.dev))
+        pos_embs = self.get_item_embedding(torch.LongTensor(pos_seqs).to(self.dev))
+        neg_embs = self.get_item_embedding(torch.LongTensor(neg_seqs).to(self.dev))
 
         pos_logits = (log_feats * pos_embs).sum(dim=-1)
         neg_logits = (log_feats * neg_embs).sum(dim=-1)
@@ -113,7 +164,7 @@ class SASRec(torch.nn.Module):
 
         final_feat = log_feats[:, -1, :] # only use last QKV classifier, a waste
 
-        item_embs = self.item_emb(torch.LongTensor(item_indices).to(self.dev)) # (U, I, C)
+        item_embs = self.get_item_embedding(torch.LongTensor(item_indices).to(self.dev)) # (U, I, C)
 
         logits = item_embs.matmul(final_feat.unsqueeze(-1)).squeeze(-1)
 

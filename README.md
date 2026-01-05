@@ -1,83 +1,69 @@
-update on 05/23/2025: thx to [Wentworth1028](https://github.com/Wentworth1028) and [Tiny-Snow](https://github.com/Tiny-Snow), we have LayerNorm update, for higher NDCG&HR, and here's the [doc](https://github.com/Tiny-Snow/SASRec.pytorch/blob/main/Result_Norm.md)👍.
+# SASRec + LLM Item Embeddings for Zero-Shot Cold-Start Recommendation
 
-update on 04/13/2025: in https://arxiv.org/html/2504.09596v1, I listed the ideas worth to try but not yet due to my limited bandwidth in sparse time.
-
-pls feel free to do these experiments to have fun, and pls consider citing the article if it somehow helps in your recsys exploration:
-
-```
-@article{huang2025revisiting_sasrec,
-  title={Revisiting Self-Attentive Sequential Recommendation},
-  author={Huang, Zan},
-  journal={CoRR},
-  volume={abs/2504.09596},
-  url={https://arxiv.org/abs/2504.09596},
-  eprinttype={arXiv},
-  eprint={2504.09596},
-  year={2025}
-}
-```
-
-or this bib for short
-
-```
-@article{huang2025revisiting,
-  title={Revisiting Self-Attentive Sequential Recommendation},
-  author={Huang, Zan},
-  journal={arXiv preprint arXiv:2504.09596},
-  year={2025}
-}
-```
-
-paper source code in `latex` folder.
-
-for questions or collaborations, pls create a new issue in this repo or drop me an email using the email address as shared.
+This project extends **SASRec** to handle **item cold-start** using **LLM-derived item embeddings**, evaluated under a **strict zero-shot setting** (cold items never appear in training).
 
 ---
 
-modified based on [paper author's tensorflow implementation](https://github.com/kang205/SASRec), switching to PyTorch(v1.6) for simplicity, fixed issues like positional embedding usage etc. (making it harder to overfit, except for that, in recsys, personalization=overfitting sometimes)
+## Motivation
+Sequential recommenders like SASRec cannot recommend unseen items because item embeddings are learned only from training data.  
+We ask:
 
-code in `python` folder.
+> **Can LLM item embeddings enable effective zero-shot item recommendation when properly aligned to the collaborative embedding space?**
 
-to train:
+---
 
-```
-python main.py --dataset=ml-1m --train_dir=default --maxlen=200 --dropout_rate=0.2 --device=cuda
-```
+## Method (High-Level)
+1. Generate **LLM item embeddings** from item metadata.
+2. Add a **linear projection head** mapping LLM embeddings → SASRec latent space.
+3. **Freeze SASRec**, train only the projection using a **ranking-aware BCE loss**.
+4. At inference:
+   - Warm items → SASRec item embeddings  
+   - Cold items → projected LLM embeddings
+5. Evaluate **cold items only** (no leakage).
 
-just inference:
+---
 
-```
-python main.py --device=cuda --dataset=ml-1m --train_dir=default --state_dict_path=[YOUR_CKPT_PATH] --inference_only=true --maxlen=200
+## Dataset & Split
+- **Dataset:** MovieLens-1M  
+- **Model:** SASRec (Pre-LayerNorm)  
+- **Sequence length:** 50  
+- **Cold-start split:**  
+  - Cold items never appear in TRAIN  
+  - Cold items appear only as TEST targets  
+  - **1705 cold-test users**
 
-```
+---
 
-output for each run would be slightly random, as negative samples are randomly sampled, here's my output for two consecutive runs:
+## Results (5 Seeds, Mean ± Std)
 
-```
-1st run - test (NDCG@10: 0.5897, HR@10: 0.8190)
-2nd run - test (NDCG@10: 0.5918, HR@10: 0.8225)
-```
+### Zero-Shot Cold Items
+| Method | HR@10 | NDCG@10 |
+|------|------|--------|
+| SASRec (baseline) | 0.0000 | 0.0000 |
+| **SASRec + LLM (BCE-trained proj)** | **0.3742 ± 0.0046** | **0.1720 ± 0.0022** |
 
-pls check paper author's [repo](https://github.com/kang205/SASRec) for detailed intro and more complete README, and here's the paper bib FYI :)
+### Overall Test (Warm + Cold)
+| Method | HR@10 | NDCG@10 |
+|------|------|--------|
+| **SASRec + LLM (BCE-trained proj)** | **0.6954 ± 0.0007** | **0.4629 ± 0.0003** |
 
-```
-@inproceedings{kang2018self,
-  title={Self-attentive sequential recommendation},
-  author={Kang, Wang-Cheng and McAuley, Julian},
-  booktitle={2018 IEEE International Conference on Data Mining (ICDM)},
-  pages={197--206},
-  year={2018},
-  organization={IEEE}
-}
-```
+**Observations**
+- Cold-start recall improves from **0 → 0.37 HR@10**
+- Very low variance across seeds
+- No degradation of warm-item performance
 
-I see a dozen of citations of the repo🫰, pls use the bib as below if needed.
-```
-@misc{Huang_SASRec_pytorch,
-author = {Huang, Zan},
-title = {{SASRec.pytorch}},
-url = {https://github.com/pmixer/SASRec.pytorch},
-howpublished = {\url{https://github.com/pmixer/SASRec.pytorch}},
-year={2020}
-}
-```
+---
+
+## Reproducibility
+
+### Train LLM Projection
+```bash
+python fit_llm_proj_bce.py \
+  --dataset ml-1m \
+  --ckpt ml-1m_zeroshot_preLN/SASRec.epoch=860.lr=0.001.layer=2.head=1.hidden=50.maxlen=50.pth \
+  --llm_emb_path artifacts/ml-1m/llm_item_emb.npy \
+  --llm_dim 384 \
+  --epochs 50 \
+  --steps_per_epoch 100 \
+  --batch_size 2048 \
+  --lr 1e-3

@@ -93,14 +93,58 @@ class WarpSampler(object):
 
 
 # train/val/test data generation
-def data_partition(fname):
+# def data_partition(fname):
+#     usernum = 0
+#     itemnum = 0
+#     User = defaultdict(list)
+#     user_train = {}
+#     user_valid = {}
+#     user_test = {}
+#     # assume user/item index starting from 1
+#     f = open('data/%s.txt' % fname, 'r')
+#     for line in f:
+#         u, i = line.rstrip().split(' ')
+#         u = int(u)
+#         i = int(i)
+#         usernum = max(u, usernum)
+#         itemnum = max(i, itemnum)
+#         User[u].append(i)
+
+#     for user in User:
+#         nfeedback = len(User[user])
+#         if nfeedback < 4:                          # To be rigorous, the training set needs at least two data points to learn
+#             user_train[user] = User[user]
+#             user_valid[user] = []
+#             user_test[user] = []
+#         else:
+#             user_train[user] = User[user][:-2]
+#             user_valid[user] = []
+#             user_valid[user].append(User[user][-2])
+#             user_test[user] = []
+#             user_test[user].append(User[user][-1])
+#     return [user_train, user_valid, user_test, usernum, itemnum]
+
+def data_partition(fname, min_cold_freq=5, max_cold_freq=20):
+    """
+    Controlled ZERO-SHOT item cold-start split.
+
+    - Define cold item set C using global item frequency on ALL interactions:
+        C = { i : min_cold_freq <= global_count[i] <= max_cold_freq }
+    - Train contains NO items in C (zero-shot).
+    - For users who interacted with any cold item:
+        test = last cold interaction in the user's timeline
+        valid = last warm interaction before test (if exists)
+        train = all earlier warm interactions (excluding cold items)
+    - For users with no cold interactions:
+        fall back to the original split:
+            if nfeedback < 4: all train
+            else: last -> test, second last -> valid, rest train
+    """
     usernum = 0
     itemnum = 0
     User = defaultdict(list)
-    user_train = {}
-    user_valid = {}
-    user_test = {}
-    # assume user/item index starting from 1
+
+    # Load full interactions (already time-sorted in your file)
     f = open('data/%s.txt' % fname, 'r')
     for line in f:
         u, i = line.rstrip().split(' ')
@@ -109,20 +153,138 @@ def data_partition(fname):
         usernum = max(u, usernum)
         itemnum = max(i, itemnum)
         User[u].append(i)
+    f.close()
 
-    for user in User:
-        nfeedback = len(User[user])
-        if nfeedback < 4:                          # To be rigorous, the training set needs at least two data points to learn
-            user_train[user] = User[user]
-            user_valid[user] = []
-            user_test[user] = []
+    # 1) Global item frequency across ALL interactions
+    global_item_count = defaultdict(int)
+    for u in User:
+        for i in User[u]:
+            global_item_count[i] += 1
+
+    # 2) Cold item set C
+    cold_items = set()
+    for i, c in global_item_count.items():
+        if min_cold_freq <= c <= max_cold_freq:
+            cold_items.add(i)
+
+    user_train = {}
+    user_valid = {}
+    user_test = {}
+
+    for u in User:
+        seq = User[u]
+        nfeedback = len(seq)
+
+        # Find last index in this user's timeline whose item is cold
+        last_cold_idx = -1
+        for idx in range(nfeedback - 1, -1, -1):
+            if seq[idx] in cold_items:
+                last_cold_idx = idx
+                break
+
+        if last_cold_idx != -1:
+            # -------- Controlled zero-shot user split --------
+            # test is last cold item
+            test_item = seq[last_cold_idx]
+
+            # valid is last warm item before test, if any
+            valid_item = None
+            for idx in range(last_cold_idx - 1, -1, -1):
+                if seq[idx] not in cold_items:
+                    valid_item = seq[idx]
+                    break
+
+            # train: all warm items before test (exclude cold items)
+            train_seq = [x for x in seq[:last_cold_idx] if x not in cold_items]
+
+            user_train[u] = train_seq
+            user_valid[u] = [valid_item] if valid_item is not None else []
+            user_test[u]  = [test_item]
+
         else:
-            user_train[user] = User[user][:-2]
-            user_valid[user] = []
-            user_valid[user].append(User[user][-2])
-            user_test[user] = []
-            user_test[user].append(User[user][-1])
+            # -------- Fallback: original split --------
+            if nfeedback < 4:
+                user_train[u] = seq
+                user_valid[u] = []
+                user_test[u] = []
+            else:
+                user_train[u] = seq[:-2]
+                user_valid[u] = [seq[-2]]
+                user_test[u]  = [seq[-1]]
+
     return [user_train, user_valid, user_test, usernum, itemnum]
+
+def evaluate_cold_test(model, dataset, args, k=0):
+    """
+    Evaluate only TEST cases where the ground-truth test item is cold by TRAIN frequency.
+    cold iff train_count(test_item) <= k.
+    For zero-shot: k=0.
+    """
+    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+
+    # Count item frequencies in TRAIN
+    train_item_count = defaultdict(int)
+    for u in train:
+        for i in train[u]:
+            train_item_count[i] += 1
+
+    NDCG = 0.0
+    HT = 0.0
+    cold_users = 0.0
+
+    users = range(1, usernum + 1)
+    for u in users:
+        if len(train[u]) < 1 or len(test[u]) < 1:
+            continue
+
+        gt_item = test[u][0]
+        if train_item_count.get(gt_item, 0) > k:
+            continue  # not cold
+
+        # Build sequence same way as evaluate()
+        seq = np.zeros([args.maxlen], dtype=np.int32)
+        idx = args.maxlen - 1
+
+        # In evaluate() for test: it prepends valid[u][0] to the sequence
+        if len(valid[u]) > 0:
+            seq[idx] = valid[u][0]
+            idx -= 1
+
+        for i in reversed(train[u]):
+            if idx == -1:
+                break
+            seq[idx] = i
+            idx -= 1
+
+        rated = set(train[u])
+        rated.add(0)
+
+        item_idx = [gt_item]
+        for _ in range(100):
+            t = np.random.randint(1, itemnum + 1)
+            while t in rated:
+                t = np.random.randint(1, itemnum + 1)
+            item_idx.append(t)
+
+        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
+        predictions = predictions[0]
+        rank = predictions.argsort().argsort()[0].item()
+
+        cold_users += 1
+        if rank < 10:
+            NDCG += 1 / np.log2(rank + 2)
+            HT += 1
+
+        # DEBUG: print first few cold cases
+        if cold_users <= 5:
+            print(f"[cold dbg] user={u}, gt_item={gt_item}, rank={rank}")
+
+
+    if cold_users == 0:
+        return (0.0, 0.0, 0)
+
+    return (NDCG / cold_users, HT / cold_users, int(cold_users))
+
 
 # TODO: merge evaluate functions for test and val set
 # evaluate on test set
@@ -143,7 +305,9 @@ def evaluate(model, dataset, args):
 
         seq = np.zeros([args.maxlen], dtype=np.int32)
         idx = args.maxlen - 1
-        seq[idx] = valid[u][0]
+        if len(valid[u]) > 0:
+            seq[idx] = valid[u][0]
+            idx -= 1
         idx -= 1
         for i in reversed(train[u]):
             seq[idx] = i

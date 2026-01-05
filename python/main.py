@@ -1,10 +1,18 @@
 import os
 import time
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 import argparse
+import random
 
 from model import SASRec
 from utils import *
+import sys
+
+
 
 def str2bool(s):
     if s not in {'false', 'true'}:
@@ -27,8 +35,19 @@ parser.add_argument('--device', default='cuda', type=str)
 parser.add_argument('--inference_only', default=False, type=str2bool)
 parser.add_argument('--state_dict_path', default=None, type=str)
 parser.add_argument('--norm_first', action='store_true', default=False)
+parser.add_argument('--use_llm', action='store_true', default=False)
+parser.add_argument('--llm_emb_path', default=None, type=str)
+parser.add_argument('--llm_dim', default=384, type=int)
+parser.add_argument('--seed', default=42, type=int)
 
 args = parser.parse_args()
+
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
+
 if not os.path.isdir(args.dataset + '_' + args.train_dir):
     os.makedirs(args.dataset + '_' + args.train_dir)
 with open(os.path.join(args.dataset + '_' + args.train_dir, 'args.txt'), 'w') as f:
@@ -43,6 +62,29 @@ if __name__ == '__main__':
     dataset = data_partition(args.dataset)
 
     [user_train, user_valid, user_test, usernum, itemnum] = dataset
+
+    if args.llm_emb_path is None:
+        args.llm_emb_path = f"artifacts/{args.dataset}/llm_item_emb.npy"
+
+    # cold mask based on TRAIN frequency
+    train_item_count = np.zeros(itemnum + 1, dtype=np.int32)
+    for u in user_train:
+        for it in user_train[u]:
+            train_item_count[it] += 1
+    cold_mask_np = (train_item_count == 0)
+
+    # load embeddings only if enabled
+    llm_emb_t = None
+    cold_mask_t = None
+    if args.use_llm:
+        llm_np = np.load(args.llm_emb_path)  # [itemnum+1, llm_dim]
+        assert llm_np.shape[0] == itemnum + 1, f"llm_np.shape={llm_np.shape}, expected first dim {itemnum+1}"
+        assert llm_np.shape[1] == args.llm_dim, f"llm dim mismatch: got {llm_np.shape[1]}, expected {args.llm_dim}"
+
+        llm_emb_t = torch.from_numpy(llm_np).float()
+        cold_mask_t = torch.from_numpy(cold_mask_np).bool()
+
+
     # num_batch = len(user_train) // args.batch_size # tail? + ((len(user_train) % args.batch_size) != 0)
     num_batch = (len(user_train) - 1) // args.batch_size + 1
     cc = 0.0
@@ -53,17 +95,23 @@ if __name__ == '__main__':
     f = open(os.path.join(args.dataset + '_' + args.train_dir, 'log.txt'), 'w')
     f.write('epoch (val_ndcg, val_hr) (test_ndcg, test_hr)\n')
     
-    sampler = WarpSampler(user_train, usernum, itemnum, batch_size=args.batch_size, maxlen=args.maxlen, n_workers=3)
-    model = SASRec(usernum, itemnum, args).to(args.device) # no ReLU activation in original SASRec implementation?
-    
-    for name, param in model.named_parameters():
-        try:
-            torch.nn.init.xavier_normal_(param.data)
-        except:
-            pass # just ignore those failed init layers
+    sampler = WarpSampler(user_train, usernum, itemnum, batch_size=args.batch_size, maxlen=args.maxlen, n_workers=12)
+    # model = SASRec(usernum, itemnum, args).to(args.device) # no ReLU activation in original SASRec implementation?
 
-    model.pos_emb.weight.data[0, :] = 0
-    model.item_emb.weight.data[0, :] = 0
+    model = SASRec(usernum, itemnum, args)
+    if args.use_llm:
+        model.set_llm_buffers(llm_emb_t, cold_mask_t)
+    model = model.to(args.device)
+
+    if not args.inference_only:
+        for name, param in model.named_parameters():
+            try:
+                torch.nn.init.xavier_normal_(param.data)
+            except:
+                pass # just ignore those failed init layers
+
+        model.pos_emb.weight.data[0, :] = 0
+        model.item_emb.weight.data[0, :] = 0
 
     # this fails embedding init 'Embedding' object has no attribute 'dim'
     # model.apply(torch.nn.init.xavier_uniform_)
@@ -73,9 +121,26 @@ if __name__ == '__main__':
     epoch_start_idx = 1
     if args.state_dict_path is not None:
         try:
-            model.load_state_dict(torch.load(args.state_dict_path, map_location=torch.device(args.device)))
-            tail = args.state_dict_path[args.state_dict_path.find('epoch=') + 6:]
-            epoch_start_idx = int(tail[:tail.find('.')]) + 1
+            # model.load_state_dict(torch.load(args.state_dict_path, map_location=torch.device(args.device)))
+            state = torch.load(args.state_dict_path, map_location=torch.device(args.device))
+            strict = not args.use_llm
+            state.pop("llm_item_emb", None)
+            state.pop("cold_item_mask", None)
+            missing, unexpected = model.load_state_dict(state, strict=strict)
+            print(f"load_state_dict strict={strict}")
+            print("  missing keys:", missing)
+            print("  unexpected keys:", unexpected)
+
+            # Only infer epoch_start_idx if path contains "epoch="
+            if args.state_dict_path is not None and "epoch=" in args.state_dict_path:
+                tail = args.state_dict_path[args.state_dict_path.find("epoch=") + 6:]
+                try:
+                    epoch_start_idx = int(tail[:tail.find(".")]) + 1
+                except Exception:
+                    epoch_start_idx = 1
+            else:
+                epoch_start_idx = 1
+
         except: # in case your pytorch version is not 1.6 etc., pls debug by pdb if load weights failed
             print('failed loading state_dicts, pls check file path: ', end="")
             print(args.state_dict_path)
@@ -87,6 +152,11 @@ if __name__ == '__main__':
         model.eval()
         t_test = evaluate(model, dataset, args)
         print('test (NDCG@10: %.4f, HR@10: %.4f)' % (t_test[0], t_test[1]))
+        t_cold = evaluate_cold_test(model, dataset, args, k=0)
+        print('cold_test k=0 (NDCG@10: %.4f, HR@10: %.4f, users: %d)' % (t_cold[0], t_cold[1], t_cold[2]))
+
+        sys.exit(0)
+
     
     # ce_criterion = torch.nn.CrossEntropyLoss()
     # https://github.com/NVIDIA/pix2pixHD/issues/9 how could an old bug appear again...
@@ -114,7 +184,9 @@ if __name__ == '__main__':
             for param in model.item_emb.parameters(): loss += args.l2_emb * torch.sum(param ** 2)    
             loss.backward()
             adam_optimizer.step()
-            print("loss in epoch {} iteration {}: {}".format(epoch, step, loss.item())) # expected 0.4~0.6 after init few epochs
+            if step == 0:
+                print(f"epoch {epoch} step {step}/{num_batch} loss {loss.item():.4f}")
+            # print("loss in epoch {} iteration {}: {}".format(epoch, step, loss.item())) # expected 0.4~0.6 after init few epochs
 
         if epoch % 20 == 0:
             model.eval()
@@ -125,6 +197,11 @@ if __name__ == '__main__':
             t_valid = evaluate_valid(model, dataset, args)
             print('epoch:%d, time: %f(s), valid (NDCG@10: %.4f, HR@10: %.4f), test (NDCG@10: %.4f, HR@10: %.4f)'
                     % (epoch, T, t_valid[0], t_valid[1], t_test[0], t_test[1]))
+
+            t_cold = evaluate_cold_test(model, dataset, args, k=0)
+            print(' | cold_test k=0 (NDCG@10: %.4f, HR@10: %.4f, users: %d)'
+                    % (t_cold[0], t_cold[1], t_cold[2]), end='')
+
 
             if t_valid[0] > best_val_ndcg or t_valid[1] > best_val_hr or t_test[0] > best_test_ndcg or t_test[1] > best_test_hr:
                 best_val_ndcg = max(t_valid[0], best_val_ndcg)
